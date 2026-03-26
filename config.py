@@ -8,7 +8,6 @@ load_dotenv()  # Carga las variables desde el archivo .env
 # ── Token del bot ──────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
 
-# FIX: valida el token al importar config, no en main() — falla rápido y claro
 if not TELEGRAM_TOKEN:
     sys.exit("❌ TELEGRAM_TOKEN no está configurado en el archivo .env")
 
@@ -26,16 +25,8 @@ MAX_FILE_SIZE_BYTES: int = MAX_FILE_SIZE_MB * 1024 * 1024
 # ── Tiempo máximo de espera para descargas ─────────────────────────────────────
 DOWNLOAD_TIMEOUT: int = int(os.getenv("DOWNLOAD_TIMEOUT", "300"))
 
-# ── Formatos de video disponibles para el usuario ─────────────────────────────
-VIDEO_FORMATS: list[dict] = [
-    {"id": "360",  "label": "📱 360p  — Liviano"},
-    {"id": "480",  "label": "🖥️ 480p  — Estándar"},
-    {"id": "720",  "label": "🎬 720p  — HD"},
-    {"id": "1080", "label": "🎥 1080p — Full HD"},
-]
-
-# ── Formato de audio disponible ────────────────────────────────────────────────
-AUDIO_FORMAT: dict = {"id": "mp3", "label": "🎵 Solo Audio — MP3"}
+# ── TTL para entradas en bot_data (segundos) ──────────────────────────────────
+BOT_DATA_TTL: int = int(os.getenv("BOT_DATA_TTL", "3600"))  # 1 hora por defecto
 
 # ── Mensajes del bot (centralizados para fácil edición) ───────────────────────
 MSG_WELCOME = (

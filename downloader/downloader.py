@@ -13,6 +13,10 @@ from telegram import Message
 
 logger = logging.getLogger(__name__)
 
+_MAX_RETRIES    = 3    # Intentos máximos antes de rendirse
+_RETRY_BASE     = 2.0  # Base del backoff exponencial (segundos)
+_RETRY_EXPONENT = 2.0  # Cada intento espera base^intento: 2s, 4s, 8s
+
 YOUTUBE_REGEX = re.compile(
     r"(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[\w\-]+"
 )
@@ -22,11 +26,21 @@ def is_valid_youtube_url(url: str) -> bool:
     return bool(YOUTUBE_REGEX.match(url.strip()))
 
 def ffmpeg_available() -> bool:
-    """FIX: función pública (antes _ffmpeg_available) para evitar imports de privadas desde otros módulos."""
+    """Verifica si ffmpeg está instalado en el sistema."""
     return shutil.which("ffmpeg") is not None
 
 async def fetch_video_info(url: str) -> Optional[dict]:
-    """Obtiene metadatos del video sin descargarlo."""
+    """
+    Obtiene metadatos del video sin descargarlo.
+    Consulta primero el caché en disco antes de llamar a YouTube.
+    """
+    from downloader.metadata_cache import get_cached_info, set_cached_info  # Import local para evitar ciclo
+
+    cached = get_cached_info(url)  # Hit de caché: evita la llamada a YouTube
+    if cached is not None:
+        logger.debug(f"Metadatos obtenidos desde caché para: {url}")
+        return cached
+
     opts = {"quiet": True, "no_warnings": True, "skip_download": True}
     try:
         loop = asyncio.get_event_loop()
@@ -34,6 +48,8 @@ async def fetch_video_info(url: str) -> Optional[dict]:
             info = await loop.run_in_executor(
                 None, lambda: ydl.extract_info(url, download=False)
             )
+        if info:
+            set_cached_info(url, info)  # Guarda en disco para futuras consultas
         return info
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Error al obtener info del video: {e}")
@@ -51,7 +67,7 @@ def extract_available_formats(info: dict) -> list[dict]:
         - size:    tamaño aproximado en bytes (puede ser None)
     """
     formats    = info.get("formats", [])
-    has_ffmpeg = ffmpeg_available()  # FIX: usa nombre público
+    has_ffmpeg = ffmpeg_available()
     seen       = set()  # Evita duplicados de resolución+ext
     result     = []
 
@@ -72,11 +88,9 @@ def extract_available_formats(info: dict) -> list[dict]:
         filesize = f.get("filesize") or f.get("filesize_approx")  # Tamaño real o estimado
 
         if has_ffmpeg:
-            # Con ffmpeg podemos combinar video+audio, ofrecemos cualquier resolución
             fmt_id = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
         else:
-            # Sin ffmpeg solo ofrecemos MP4 con audio ya incluido
-            if acodec == "none":  # Formato sin audio — no sirve sin ffmpeg
+            if acodec == "none":  # Sin ffmpeg, descarta formatos sin audio
                 continue
             fmt_id = f"best[height<={height}][ext=mp4]/best[height<={height}]"
 
@@ -88,14 +102,13 @@ def extract_available_formats(info: dict) -> list[dict]:
             "size":   filesize,
         })
 
-    # Elimina duplicados de altura (deja el de mayor calidad por altura)
+    # Deja el formato de mayor calidad por altura
     unique: dict[int, dict] = {}
     for item in result:
         h = item["height"]
         if h not in unique or (item["size"] or 0) > (unique[h]["size"] or 0):
             unique[h] = item
 
-    # Ordena de menor a mayor resolución y agrega MP3 al final
     sorted_formats = sorted(unique.values(), key=lambda x: x["height"])
     sorted_formats.append({  # Opción de solo audio siempre al final
         "id":     "mp3",
@@ -109,7 +122,7 @@ def extract_available_formats(info: dict) -> list[dict]:
 
 def _format_label(height: int, ext: str, size: Optional[int], has_ffmpeg: bool) -> str:
     """Construye la etiqueta legible para un formato."""
-    if height >= 1080:  # Emoji según resolución
+    if height >= 1080:
         icon = "🎥"
     elif height >= 720:
         icon = "🎬"
@@ -121,13 +134,13 @@ def _format_label(height: int, ext: str, size: Optional[int], has_ffmpeg: bool) 
     quality_names = {2160: "4K", 1440: "2K", 1080: "Full HD", 720: "HD", 480: "SD", 360: "360p", 240: "240p", 144: "144p"}
     quality = quality_names.get(height, f"{height}p")
 
-    if size:  # Tamaño aproximado
+    if size:
         mb       = size / (1024 * 1024)
         size_str = f" ~{mb:.0f}MB" if mb >= 1 else f" ~{size//1024}KB"
     else:
         size_str = ""
 
-    ffmpeg_note = "" if has_ffmpeg else " ⚠️"  # Aviso si no hay ffmpeg
+    ffmpeg_note = "" if has_ffmpeg else " ⚠️"
     return f"{icon} {height}p — {quality} ({ext.upper()}){size_str}{ffmpeg_note}"
 
 async def download_media(
@@ -136,7 +149,11 @@ async def download_media(
     status_message: Message,
 ) -> Optional[Path]:
     """
-    Descarga el video o audio desde YouTube.
+    Descarga el video o audio desde YouTube con reintentos automáticos.
+
+    Reintenta hasta _MAX_RETRIES veces ante errores de red o de yt-dlp,
+    usando backoff exponencial entre intentos. No reintenta si el archivo
+    supera el límite de Telegram (error permanente, no transitorio).
 
     Args:
         url:            Enlace de YouTube.
@@ -147,39 +164,53 @@ async def download_media(
         Ruta al archivo descargado, 'TOO_LARGE' si supera el límite, o None si falló.
     """
     loop       = asyncio.get_event_loop()
-    tracker    = ProgressTracker(status_message, loop)
     has_ffmpeg = ffmpeg_available()
-    ydl_opts   = _build_ydl_opts(format_id, tracker, has_ffmpeg)
 
-    try:
-        downloaded_path = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: _run_download(url, ydl_opts)),
-            timeout=DOWNLOAD_TIMEOUT,
-        )
+    for attempt in range(1, _MAX_RETRIES + 1):
+        tracker  = ProgressTracker(status_message, loop)  # Tracker fresco en cada intento
+        ydl_opts = _build_ydl_opts(format_id, tracker, has_ffmpeg)
 
-        if downloaded_path is None:
-            return None
+        try:
+            downloaded_path = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: _run_download(url, ydl_opts)),
+                timeout=DOWNLOAD_TIMEOUT,
+            )
 
-        if downloaded_path.stat().st_size > MAX_FILE_SIZE_BYTES:  # Valida límite de Telegram
-            downloaded_path.unlink(missing_ok=True)
-            logger.warning(f"Archivo supera el límite de tamaño: {downloaded_path}")
-            return "TOO_LARGE"
+            if downloaded_path is None:
+                raise RuntimeError("yt-dlp no retornó ningún archivo")
 
-        return downloaded_path
+            if downloaded_path.stat().st_size > MAX_FILE_SIZE_BYTES:  # Error permanente — no reintenta
+                downloaded_path.unlink(missing_ok=True)
+                logger.warning(f"Archivo supera el límite de tamaño: {downloaded_path}")
+                return "TOO_LARGE"
 
-    except asyncio.TimeoutError:
-        logger.error(f"Timeout al descargar: {url}")
-        return None
-    except Exception as e:
-        logger.error(f"Error inesperado en descarga: {e}")
-        return None
+            return downloaded_path  # Descarga exitosa
+
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout en intento {attempt}/{_MAX_RETRIES}: {url}")
+        except Exception as e:
+            logger.warning(f"Error en intento {attempt}/{_MAX_RETRIES}: {e}")
+
+        if attempt < _MAX_RETRIES:
+            wait = _RETRY_BASE ** attempt  # 2s, 4s, 8s entre intentos
+            logger.info(f"Reintentando en {wait:.0f}s...")
+            try:
+                await status_message.edit_text(
+                    f"⚠️ Error en intento {attempt}/{_MAX_RETRIES}. Reintentando en {wait:.0f}s...",
+                )
+            except Exception:
+                pass  # Si falla editar el mensaje, continúa igual
+            await asyncio.sleep(wait)
+
+    logger.error(f"Descarga fallida tras {_MAX_RETRIES} intentos: {url}")
+    return None
 
 def _build_ydl_opts(format_id: str, tracker: ProgressTracker, has_ffmpeg: bool) -> dict:
     """Construye las opciones de yt-dlp según el formato y disponibilidad de ffmpeg."""
     output_template = str(DOWNLOAD_PATH / "%(title)s.%(ext)s")
 
     if format_id == "mp3":
-        if has_ffmpeg:  # Con ffmpeg: extrae y convierte a MP3
+        if has_ffmpeg:
             return {
                 "format":         "bestaudio/best",
                 "outtmpl":        output_template,
@@ -192,7 +223,7 @@ def _build_ydl_opts(format_id: str, tracker: ProgressTracker, has_ffmpeg: bool) 
                     "preferredquality": "192",
                 }],
             }
-        else:  # Sin ffmpeg: descarga mejor audio nativo
+        else:
             return {
                 "format":         "bestaudio[ext=m4a]/bestaudio/best",
                 "outtmpl":        output_template,
@@ -201,7 +232,6 @@ def _build_ydl_opts(format_id: str, tracker: ProgressTracker, has_ffmpeg: bool) 
                 "progress_hooks": [tracker.hook],
             }
 
-    # Formato de video: el format_id ya viene construido desde extract_available_formats()
     opts = {
         "format":         format_id,
         "outtmpl":        output_template,
@@ -210,14 +240,13 @@ def _build_ydl_opts(format_id: str, tracker: ProgressTracker, has_ffmpeg: bool) 
         "progress_hooks": [tracker.hook],
     }
     if has_ffmpeg:
-        opts["merge_output_format"] = "mp4"  # Unifica en MP4 solo si ffmpeg está disponible
+        opts["merge_output_format"] = "mp4"
     return opts
 
 def _run_download(url: str, opts: dict) -> Optional[Path]:
     """
-    FIX: usa requested_downloads para obtener la ruta final real,
-    que puede diferir del nombre original tras el postprocesado de ffmpeg (ej: .webm → .mp3).
-    Solo cae al método de búsqueda por extensión si requested_downloads no está disponible.
+    Ejecuta la descarga y retorna la ruta real del archivo,
+    usando requested_downloads para manejar conversiones de ffmpeg correctamente.
     """
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -228,14 +257,12 @@ def _run_download(url: str, opts: dict) -> Optional[Path]:
     if "entries" in info:  # Si es playlist, toma solo el primer video
         info = info["entries"][0]
 
-    # FIX: intenta obtener la ruta real del archivo postprocesado
     requested = info.get("requested_downloads")
     if requested:
         filepath = Path(requested[0]["filepath"])
         if filepath.exists():
             return filepath
 
-    # Fallback: busca por extensiones alternativas si la ruta directa no existe
     filepath = Path(ydl.prepare_filename(info))
     if filepath.exists():
         return filepath
