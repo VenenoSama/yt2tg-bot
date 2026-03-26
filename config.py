@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -6,6 +7,10 @@ load_dotenv()  # Carga las variables desde el archivo .env
 
 # ── Token del bot ──────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
+
+# FIX: valida el token al importar config, no en main() — falla rápido y claro
+if not TELEGRAM_TOKEN:
+    sys.exit("❌ TELEGRAM_TOKEN no está configurado en el archivo .env")
 
 # ── ID del administrador (para comandos restringidos) ──────────────────────────
 ADMIN_ID: int = int(os.getenv("ADMIN_ID", "0"))
@@ -22,7 +27,6 @@ MAX_FILE_SIZE_BYTES: int = MAX_FILE_SIZE_MB * 1024 * 1024
 DOWNLOAD_TIMEOUT: int = int(os.getenv("DOWNLOAD_TIMEOUT", "300"))
 
 # ── Formatos de video disponibles para el usuario ─────────────────────────────
-# Solo contienen id y label — la lógica del formato yt-dlp vive en downloader.py
 VIDEO_FORMATS: list[dict] = [
     {"id": "360",  "label": "📱 360p  — Liviano"},
     {"id": "480",  "label": "🖥️ 480p  — Estándar"},

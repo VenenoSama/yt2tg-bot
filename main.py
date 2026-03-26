@@ -1,3 +1,4 @@
+import hashlib
 import logging
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -21,7 +22,7 @@ from config import (
     MSG_WELCOME,
     TELEGRAM_TOKEN,
 )
-from downloader import download_media, extract_available_formats, fetch_video_info, is_valid_youtube_url
+from downloader import download_media, extract_available_formats, fetch_video_info, is_valid_youtube_url, ffmpeg_available  # FIX: exportado desde __init__, sin import interno
 from status import cmd_status
 from utils import cleanup_file, format_duration, format_size, safe_filename
 
@@ -65,6 +66,7 @@ async def _process_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
       - Valida la URL
       - Obtiene info real del video desde YouTube
       - Extrae los formatos disponibles
+      - Guarda la URL en bot_data usando un hash como clave
       - Muestra el menú de selección con formatos reales
     """
     if not is_valid_youtube_url(url):
@@ -78,23 +80,25 @@ async def _process_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
         await status_msg.edit_text("❌ No se pudo obtener información del video.")
         return
 
-    # Extrae los formatos reales disponibles para ese video específico
-    formats = extract_available_formats(info)
+    formats = extract_available_formats(info)  # Formatos reales disponibles para el video
 
     if not formats:
         await status_msg.edit_text("❌ No se encontraron formatos disponibles para este video.")
         return
 
+    # FIX: guarda la URL completa en bot_data con su hash como clave
+    url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+    context.bot_data[url_hash] = url
+
     title    = safe_filename(info.get("title", "Sin título"))
     duration = format_duration(info.get("duration"))
     thumb    = info.get("thumbnail")
 
-    # Informa si ffmpeg no está disponible
-    from downloader.downloader import _ffmpeg_available
+    # FIX: usa la función pública exportada, sin import interno en función
     ffmpeg_note = (
         "\n\n⚠️ *ffmpeg no instalado* — solo formatos pre-mezclados disponibles.\n"
         "Instala ffmpeg para acceder a mayor calidad."
-    ) if not _ffmpeg_available() else ""
+    ) if not ffmpeg_available() else ""
 
     caption = (
         f"🎬 *{title}*\n"
@@ -104,7 +108,7 @@ async def _process_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
         f"{MSG_SELECT_FORMAT}"
     )
 
-    keyboard = _build_format_keyboard(url, formats)  # Teclado con formatos reales
+    keyboard = _build_format_keyboard(url_hash, formats)  # FIX: pasa el hash, no la URL
 
     await status_msg.delete()
 
@@ -118,58 +122,55 @@ async def _process_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
             caption, parse_mode="Markdown", reply_markup=keyboard
         )
 
-def _build_format_keyboard(url: str, formats: list[dict]) -> InlineKeyboardMarkup:
+def _build_format_keyboard(url_hash: str, formats: list[dict]) -> InlineKeyboardMarkup:
     """
     Construye el teclado inline con los formatos reales del video.
-    Cada botón codifica el índice del formato en lugar del format_id completo
-    (los format_id de yt-dlp pueden ser muy largos para callback_data).
-    El formato se guarda en el contexto usando el índice como clave.
+    FIX: usa url_hash en callback_data para no superar el límite de 64 bytes de Telegram.
+    La URL completa se recupera desde bot_data en el handler de selección.
     """
     buttons = []
     for i, fmt in enumerate(formats):
-        # callback_data: "dl|<indice>|<url>"
-        # Usamos índice para no superar el límite de 64 bytes de Telegram
-        callback = f"dl|{i}|{url}"
-        if len(callback) > 64:  # Si la URL es muy larga, la recortamos con hash
-            import hashlib
-            url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
-            callback = f"dl|{i}|{url_hash}"
-            # Guardamos la URL completa en bot_data para recuperarla después
-        buttons.append([InlineKeyboardButton(fmt["label"], callback_data=f"dl|{i}|{url}")])
+        callback = f"dl|{i}|{url_hash}"  # FIX: siempre dentro del límite de 64 bytes
+        buttons.append([InlineKeyboardButton(fmt["label"], callback_data=callback)])
 
     return InlineKeyboardMarkup(buttons)
 
 async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Paso 2 del flujo: recibe la selección del formato y ejecuta la descarga.
-    Para recuperar el format_id real, vuelve a consultar la info del video.
+    FIX: recupera la URL real desde bot_data usando el hash almacenado en Paso 1.
     """
     query = update.callback_query
     await query.answer()
 
-    parts = query.data.split("|", 2)  # "dl|<indice>|<url>"
+    parts = query.data.split("|", 2)  # "dl|<indice>|<url_hash>"
     if len(parts) != 3:
         await query.message.reply_text("❌ Datos inválidos, intenta de nuevo.")
         return
 
-    _, idx_str, url = parts
+    _, idx_str, url_hash = parts
     idx = int(idx_str)
+
+    # FIX: recupera la URL completa desde bot_data con el hash como clave
+    url = context.bot_data.get(url_hash)
+    if not url:
+        await query.message.reply_text("❌ La sesión expiró. Envía el enlace de nuevo.")
+        return
 
     status_msg = await query.message.reply_text("🔍 Verificando formatos...")
 
-    # Recupera los formatos del video para obtener el format_id real según el índice
-    info = await fetch_video_info(url)
+    info = await fetch_video_info(url)  # Recupera formatos del video para obtener el format_id real
     if info is None:
         await status_msg.edit_text("❌ No se pudo recuperar la información del video.")
         return
 
-    formats   = extract_available_formats(info)
+    formats = extract_available_formats(info)
     if idx >= len(formats):
         await status_msg.edit_text("❌ Formato no válido, intenta de nuevo.")
         return
 
     chosen    = formats[idx]
-    format_id = chosen["id"]    # format_id real de yt-dlp (ej: "bestvideo[height<=720]+bestaudio")
+    format_id = chosen["id"]  # format_id real de yt-dlp (ej: "bestvideo[height<=720]+bestaudio")
 
     logger.info(f"Formato elegido: {chosen['label']} → {format_id}")
 
@@ -206,6 +207,8 @@ async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_
         await status_msg.edit_text(MSG_DONE)
         logger.info(f"Archivo enviado: {result.name}")
 
+        context.bot_data.pop(url_hash, None)  # Limpia la URL del bot_data tras envío exitoso
+
     except Exception as e:
         logger.error(f"Error al enviar archivo: {e}")
         await status_msg.edit_text(MSG_ERROR.format(error=str(e)), parse_mode="Markdown")
@@ -216,10 +219,7 @@ async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_
 
 def main() -> None:
     """Inicializa y arranca el bot."""
-    if not TELEGRAM_TOKEN:
-        raise ValueError("❌ TELEGRAM_TOKEN no está configurado en el archivo .env")
-
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()  # FIX: validación movida a config.py
 
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("status",   cmd_status))

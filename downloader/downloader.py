@@ -21,8 +21,8 @@ def is_valid_youtube_url(url: str) -> bool:
     """Retorna True si la URL es un enlace válido de YouTube."""
     return bool(YOUTUBE_REGEX.match(url.strip()))
 
-def _ffmpeg_available() -> bool:
-    """Detecta si ffmpeg está instalado en el sistema."""
+def ffmpeg_available() -> bool:
+    """FIX: función pública (antes _ffmpeg_available) para evitar imports de privadas desde otros módulos."""
     return shutil.which("ffmpeg") is not None
 
 async def fetch_video_info(url: str) -> Optional[dict]:
@@ -50,9 +50,9 @@ def extract_available_formats(info: dict) -> list[dict]:
         - ext:     extensión del archivo
         - size:    tamaño aproximado en bytes (puede ser None)
     """
-    formats   = info.get("formats", [])
-    has_ffmpeg = _ffmpeg_available()
-    seen       = set()   # Evita duplicados de resolución+ext
+    formats    = info.get("formats", [])
+    has_ffmpeg = ffmpeg_available()  # FIX: usa nombre público
+    seen       = set()  # Evita duplicados de resolución+ext
     result     = []
 
     for f in formats:
@@ -72,20 +72,20 @@ def extract_available_formats(info: dict) -> list[dict]:
         filesize = f.get("filesize") or f.get("filesize_approx")  # Tamaño real o estimado
 
         if has_ffmpeg:
-            # Con ffmpeg podemos combinar video+audio por lo que ofrecemos cualquier resolución
+            # Con ffmpeg podemos combinar video+audio, ofrecemos cualquier resolución
             fmt_id = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
         else:
             # Sin ffmpeg solo ofrecemos MP4 con audio ya incluido
-            if acodec == "none":  # Este formato no tiene audio — no sirve sin ffmpeg
+            if acodec == "none":  # Formato sin audio — no sirve sin ffmpeg
                 continue
             fmt_id = f"best[height<={height}][ext=mp4]/best[height<={height}]"
 
         result.append({
-            "id":      fmt_id,
-            "label":   _format_label(height, ext, filesize, has_ffmpeg),
-            "height":  height,
-            "ext":     ext,
-            "size":    filesize,
+            "id":     fmt_id,
+            "label":  _format_label(height, ext, filesize, has_ffmpeg),
+            "height": height,
+            "ext":    ext,
+            "size":   filesize,
         })
 
     # Elimina duplicados de altura (deja el de mayor calidad por altura)
@@ -109,8 +109,7 @@ def extract_available_formats(info: dict) -> list[dict]:
 
 def _format_label(height: int, ext: str, size: Optional[int], has_ffmpeg: bool) -> str:
     """Construye la etiqueta legible para un formato."""
-    # Emoji según resolución
-    if height >= 1080:
+    if height >= 1080:  # Emoji según resolución
         icon = "🎥"
     elif height >= 720:
         icon = "🎬"
@@ -119,13 +118,11 @@ def _format_label(height: int, ext: str, size: Optional[int], has_ffmpeg: bool) 
     else:
         icon = "📱"
 
-    # Nombre de calidad
     quality_names = {2160: "4K", 1440: "2K", 1080: "Full HD", 720: "HD", 480: "SD", 360: "360p", 240: "240p", 144: "144p"}
     quality = quality_names.get(height, f"{height}p")
 
-    # Tamaño aproximado
-    if size:
-        mb    = size / (1024 * 1024)
+    if size:  # Tamaño aproximado
+        mb       = size / (1024 * 1024)
         size_str = f" ~{mb:.0f}MB" if mb >= 1 else f" ~{size//1024}KB"
     else:
         size_str = ""
@@ -151,7 +148,7 @@ async def download_media(
     """
     loop       = asyncio.get_event_loop()
     tracker    = ProgressTracker(status_message, loop)
-    has_ffmpeg = _ffmpeg_available()
+    has_ffmpeg = ffmpeg_available()
     ydl_opts   = _build_ydl_opts(format_id, tracker, has_ffmpeg)
 
     try:
@@ -217,7 +214,11 @@ def _build_ydl_opts(format_id: str, tracker: ProgressTracker, has_ffmpeg: bool) 
     return opts
 
 def _run_download(url: str, opts: dict) -> Optional[Path]:
-    """Ejecuta la descarga con yt-dlp y retorna la ruta del archivo resultante."""
+    """
+    FIX: usa requested_downloads para obtener la ruta final real,
+    que puede diferir del nombre original tras el postprocesado de ffmpeg (ej: .webm → .mp3).
+    Solo cae al método de búsqueda por extensión si requested_downloads no está disponible.
+    """
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
 
@@ -227,12 +228,21 @@ def _run_download(url: str, opts: dict) -> Optional[Path]:
     if "entries" in info:  # Si es playlist, toma solo el primer video
         info = info["entries"][0]
 
+    # FIX: intenta obtener la ruta real del archivo postprocesado
+    requested = info.get("requested_downloads")
+    if requested:
+        filepath = Path(requested[0]["filepath"])
+        if filepath.exists():
+            return filepath
+
+    # Fallback: busca por extensiones alternativas si la ruta directa no existe
     filepath = Path(ydl.prepare_filename(info))
+    if filepath.exists():
+        return filepath
 
-    if not filepath.exists():  # Busca extensiones alternativas si el nombre exacto no existe
-        for ext in (".mp4", ".mp3", ".m4a", ".webm", ".mkv", ".opus"):
-            alt = filepath.with_suffix(ext)
-            if alt.exists():
-                return alt
+    for ext in (".mp4", ".mp3", ".m4a", ".webm", ".mkv", ".opus"):
+        alt = filepath.with_suffix(ext)
+        if alt.exists():
+            return alt
 
-    return filepath if filepath.exists() else None
+    return None
